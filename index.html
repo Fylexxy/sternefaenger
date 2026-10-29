@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Sternenfänger</title>
+<style>
+  body {
+    margin: 0;
+    height: 100vh;
+    background: #111;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+  }
+  canvas {
+    border: 3px solid #444;
+    border-radius: 8px;
+    max-width: calc(100vw - 6px);  /* Spielfeld schrumpft auf kleinen Bildschirmen */
+    max-height: calc(100vh - 6px);
+    touch-action: none;            /* Kein Scrollen oder Zoomen beim Tippen */
+  }
+</style>
+</head>
+<body>
+<canvas id="spiel"></canvas>
+<script>
+// =====================================================
+// EINSTELLUNGEN – hier kannst du alles leicht ändern!
+// =====================================================
+const CONFIG = {
+  breite: 480,                 // Breite des Spielfelds in Pixeln
+  hoehe: 640,                  // Höhe des Spielfelds in Pixeln
+  hintergrundFarbe: "#0b1030", // Farbe des Hintergrunds
+  spielerFarbe: "#4fc3f7",     // Farbe des Spieler-Quadrats
+  sternFarbe: "#ffd54f",       // Farbe der Sterne
+  bombenFarbe: "#333333",      // Farbe der Bomben
+  zuendschnurFarbe: "#ff7043", // Farbe der Zündschnur an der Bombe
+  textFarbe: "#ffffff",        // Farbe für alle Texte
+  spielerGroesse: 40,          // Seitenlänge des Spieler-Quadrats
+  spielerTempo: 400,           // Wie schnell sich der Spieler bewegt (Pixel pro Sekunde)
+  startLeben: 3,               // Anzahl Leben zu Beginn
+  objektGroesse: 30,           // Größe von Sternen und Bomben
+  fallTempoStart: 150,         // Fallgeschwindigkeit am Anfang (Pixel pro Sekunde)
+  fallTempoZuwachs: 5,         // So viel schneller wird es pro Sekunde Spielzeit
+  spawnAbstandStart: 0.9,      // Sekunden zwischen zwei neuen Objekten am Anfang
+  spawnAbstandMinimum: 0.3,    // Kürzester möglicher Abstand zwischen Objekten
+  spawnAbstandAbnahme: 0.01,   // So viel kürzer wird der Abstand pro Sekunde
+  bombenAnteil: 0.3,           // Anteil der Bomben (0.3 = 30 Prozent)
+  punkteProStern: 10,          // Punkte für einen gefangenen Stern
+  schutzZeit: 1.0,             // Sekunden ohne Schaden nach einem Bombentreffer
+  highscoreSchluessel: "sternenfaenger_highscore" // Name für den Speicher im Browser
+};
+
+// =====================================================
+// SPIELZUSTAND – alles, was sich während des Spiels ändert
+// =====================================================
+const canvas = document.getElementById("spiel");
+const ctx = canvas.getContext("2d");
+canvas.width = CONFIG.breite;
+canvas.height = CONFIG.hoehe;
+
+let zustand = "start";   // "start", "spielen" oder "gameover"
+let spieler = { x: 0, y: 0 };
+let objekte = [];        // Liste aller fallenden Sterne und Bomben
+let punkte = 0;
+let leben = 0;
+let highscore = ladeHighscore();
+let spielzeit = 0;       // Wie lange die aktuelle Runde schon läuft (Sekunden)
+let spawnTimer = 0;      // Zählt die Zeit bis zum nächsten neuen Objekt
+let schutzTimer = 0;     // Restzeit, in der der Spieler unverwundbar ist
+let letzteZeit = 0;      // Zeitpunkt des letzten Bildes
+const tasten = {};       // Merkt sich, welche Tasten gerade gedrückt sind
+let touchRichtung = 0;   // Touchscreen: -1 = links, 1 = rechts, 0 = nichts
+
+// =====================================================
+// EINGABE – Tastatur abfragen
+// =====================================================
+document.addEventListener("keydown", function (e) {
+  tasten[e.key] = true;
+  if (e.key === " " || e.key === "ArrowLeft" || e.key === "ArrowRight") {
+    e.preventDefault(); // Verhindert, dass die Seite scrollt
+  }
+  if (e.key === " " && zustand !== "spielen") {
+    starteSpiel();
+  }
+});
+
+document.addEventListener("keyup", function (e) {
+  tasten[e.key] = false;
+});
+
+// Touchscreen: Finger auf der linken Hälfte = links, rechte Hälfte = rechts
+function behandleTouch(e) {
+  e.preventDefault();
+  if (e.touches.length === 0) {
+    touchRichtung = 0; // Finger losgelassen
+    return;
+  }
+  const rand = canvas.getBoundingClientRect();
+  const fingerX = e.touches[0].clientX - rand.left;
+  touchRichtung = fingerX < rand.width / 2 ? -1 : 1;
+}
+
+canvas.addEventListener("touchstart", function (e) {
+  if (zustand !== "spielen") starteSpiel(); // Tippen startet das Spiel
+  behandleTouch(e);
+}, { passive: false });
+canvas.addEventListener("touchmove", behandleTouch, { passive: false });
+canvas.addEventListener("touchend", behandleTouch, { passive: false });
+canvas.addEventListener("touchcancel", behandleTouch, { passive: false });
+
+function linksGedrueckt() {
+  return tasten["ArrowLeft"] || touchRichtung === -1;
+}
+
+function rechtsGedrueckt() {
+  return tasten["ArrowRight"] || touchRichtung === 1;
+}
+
+// =====================================================
+// SPIELLOGIK – Regeln des Spiels
+// =====================================================
+function starteSpiel() {
+  zustand = "spielen";
+  punkte = 0;
+  leben = CONFIG.startLeben;
+  spielzeit = 0;
+  spawnTimer = 0;
+  schutzTimer = 0;
+  objekte = [];
+  spieler.x = CONFIG.breite / 2 - CONFIG.spielerGroesse / 2;
+  spieler.y = CONFIG.hoehe - CONFIG.spielerGroesse - 20;
+}
+
+function bewegeSpieler(dt) {
+  if (linksGedrueckt()) spieler.x -= CONFIG.spielerTempo * dt;
+  if (rechtsGedrueckt()) spieler.x += CONFIG.spielerTempo * dt;
+  // Spieler darf das Spielfeld nicht verlassen
+  spieler.x = Math.max(0, Math.min(CONFIG.breite - CONFIG.spielerGroesse, spieler.x));
+}
+
+function aktuellesFallTempo() {
+  return CONFIG.fallTempoStart + spielzeit * CONFIG.fallTempoZuwachs;
+}
+
+function aktuellerSpawnAbstand() {
+  const abstand = CONFIG.spawnAbstandStart - spielzeit * CONFIG.spawnAbstandAbnahme;
+  return Math.max(CONFIG.spawnAbstandMinimum, abstand);
+}
+
+function erzeugeObjekt() {
+  const istBombe = Math.random() < CONFIG.bombenAnteil;
+  objekte.push({
+    x: Math.random() * (CONFIG.breite - CONFIG.objektGroesse),
+    y: -CONFIG.objektGroesse,
+    typ: istBombe ? "bombe" : "stern"
+  });
+}
+
+function beruehrtSpieler(obj) {
+  const g = CONFIG.objektGroesse;
+  const s = CONFIG.spielerGroesse;
+  return obj.x < spieler.x + s && obj.x + g > spieler.x &&
+         obj.y < spieler.y + s && obj.y + g > spieler.y;
+}
+
+function fangeObjekt(obj) {
+  if (obj.typ === "stern") {
+    punkte += CONFIG.punkteProStern;
+  } else if (schutzTimer <= 0) {
+    verliereLeben();
+  }
+}
+
+function verliereLeben() {
+  leben -= 1;
+  schutzTimer = CONFIG.schutzZeit;
+  if (leben <= 0) beendeSpiel();
+}
+
+function aktualisiereObjekte(dt) {
+  const tempo = aktuellesFallTempo();
+  for (let i = objekte.length - 1; i >= 0; i--) {
+    const obj = objekte[i];
+    obj.y += tempo * dt;
+    if (beruehrtSpieler(obj)) {
+      fangeObjekt(obj);
+      objekte.splice(i, 1);  // Gefangenes Objekt entfernen
+    } else if (obj.y > CONFIG.hoehe) {
+      objekte.splice(i, 1);  // Objekt ist unten herausgefallen
+    }
+  }
+}
+
+function aktualisiere(dt) {
+  spielzeit += dt;
+  schutzTimer -= dt;
+  bewegeSpieler(dt);
+
+  spawnTimer += dt;
+  if (spawnTimer >= aktuellerSpawnAbstand()) {
+    spawnTimer = 0;
+    erzeugeObjekt();
+  }
+  aktualisiereObjekte(dt);
+}
+
+function beendeSpiel() {
+  zustand = "gameover";
+  if (punkte > highscore) {
+    highscore = punkte;
+    speichereHighscore();
+  }
+}
+
+function ladeHighscore() {
+  try {
+    return Number(localStorage.getItem(CONFIG.highscoreSchluessel)) || 0;
+  } catch (fehler) {
+    return 0; // Speicher nicht verfügbar – dann eben 0
+  }
+}
+
+function speichereHighscore() {
+  try {
+    localStorage.setItem(CONFIG.highscoreSchluessel, highscore);
+  } catch (fehler) {
+    // Speichern nicht möglich – Spiel läuft trotzdem weiter
+  }
+}
+
+// =====================================================
+// ZEICHNEN – alles auf den Bildschirm malen
+// =====================================================
+function zeichneHintergrund() {
+  ctx.fillStyle = CONFIG.hintergrundFarbe;
+  ctx.fillRect(0, 0, CONFIG.breite, CONFIG.hoehe);
+}
+
+function zeichneSpieler() {
+  // Nach einem Treffer blinkt der Spieler
+  if (schutzTimer > 0 && Math.floor(schutzTimer * 10) % 2 === 0) return;
+  ctx.fillStyle = CONFIG.spielerFarbe;
+  ctx.fillRect(spieler.x, spieler.y, CONFIG.spielerGroesse, CONFIG.spielerGroesse);
+}
+
+function zeichneStern(x, y, groesse) {
+  const mitteX = x + groesse / 2;
+  const mitteY = y + groesse / 2;
+  const aussen = groesse / 2;
+  const innen = groesse / 4.5;
+  ctx.fillStyle = CONFIG.sternFarbe;
+  ctx.beginPath();
+  for (let i = 0; i < 10; i++) {
+    const radius = i % 2 === 0 ? aussen : innen;
+    const winkel = -Math.PI / 2 + i * Math.PI / 5;
+    ctx.lineTo(mitteX + Math.cos(winkel) * radius, mitteY + Math.sin(winkel) * radius);
+  }
+  ctx.closePath();
+  ctx.fill();
+}
+
+function zeichneBombe(x, y, groesse) {
+  const mitteX = x + groesse / 2;
+  const mitteY = y + groesse / 2 + 2;
+  ctx.fillStyle = CONFIG.bombenFarbe;
+  ctx.beginPath();
+  ctx.arc(mitteX, mitteY, groesse / 2.3, 0, Math.PI * 2);
+  ctx.fill();
+  // Zündschnur
+  ctx.strokeStyle = CONFIG.zuendschnurFarbe;
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.moveTo(mitteX, mitteY - groesse / 2.3);
+  ctx.lineTo(mitteX + 5, y - 4);
+  ctx.stroke();
+}
+
+function zeichneObjekte() {
+  for (const obj of objekte) {
+    if (obj.typ === "stern") zeichneStern(obj.x, obj.y, CONFIG.objektGroesse);
+    else zeichneBombe(obj.x, obj.y, CONFIG.objektGroesse);
+  }
+}
+
+function zeichneText(text, x, y, groesse, ausrichtung) {
+  ctx.fillStyle = CONFIG.textFarbe;
+  ctx.font = "bold " + groesse + "px Arial";
+  ctx.textAlign = ausrichtung;
+  ctx.fillText(text, x, y);
+}
+
+function zeichneAnzeige() {
+  zeichneText("Punkte: " + punkte, 15, 30, 20, "left");
+  zeichneText("Leben: " + "♥".repeat(Math.max(0, leben)), CONFIG.breite - 15, 30, 20, "right");
+  zeichneText("Highscore: " + highscore, CONFIG.breite / 2, 30, 16, "center");
+}
+
+function zeichneStartBildschirm() {
+  const mitte = CONFIG.breite / 2;
+  zeichneText("STERNENFÄNGER", mitte, 220, 40, "center");
+  zeichneText("Fange Sterne, weiche Bomben aus!", mitte, 280, 18, "center");
+  zeichneText("Steuerung: Pfeiltasten ← →", mitte, 310, 18, "center");
+  zeichneText("Handy: links / rechts gedrückt halten", mitte, 335, 18, "center");
+  zeichneText("Highscore: " + highscore, mitte, 390, 20, "center");
+  zeichneText("Leertaste oder Tippen zum Starten", mitte, 460, 22, "center");
+}
+
+function zeichneGameOver() {
+  const mitte = CONFIG.breite / 2;
+  ctx.fillStyle = "rgba(0, 0, 0, 0.6)";
+  ctx.fillRect(0, 0, CONFIG.breite, CONFIG.hoehe);
+  zeichneText("GAME OVER", mitte, 240, 44, "center");
+  zeichneText("Punkte: " + punkte, mitte, 300, 24, "center");
+  zeichneText("Highscore: " + highscore, mitte, 335, 20, "center");
+  zeichneText("Leertaste oder Tippen für neues Spiel", mitte, 420, 20, "center");
+}
+
+function zeichne() {
+  zeichneHintergrund();
+  if (zustand === "start") {
+    zeichneStartBildschirm();
+    return;
+  }
+  zeichneObjekte();
+  zeichneSpieler();
+  zeichneAnzeige();
+  if (zustand === "gameover") zeichneGameOver();
+}
+
+// =====================================================
+// SPIELSCHLEIFE – läuft ca. 60 Mal pro Sekunde
+// =====================================================
+function spielschleife(zeit) {
+  // dt = vergangene Zeit seit dem letzten Bild in Sekunden (begrenzt, falls der Tab pausiert war)
+  const dt = Math.min((zeit - letzteZeit) / 1000, 0.05);
+  letzteZeit = zeit;
+  if (zustand === "spielen") aktualisiere(dt);
+  zeichne();
+  requestAnimationFrame(spielschleife);
+}
+
+requestAnimationFrame(spielschleife);
+
+/* =====================================================
+   IDEEN ZUM WEITERBAUEN (von leicht bis schwer)
+   =====================================================
+   1.  Farben ändern: Passe die Farben im CONFIG-Objekt an (z.B. pinker Spieler).
+   2.  Schwierigkeit anpassen: Ändere Leben, Fallgeschwindigkeit oder Bombenanteil.
+   3.  Hintergrund-Sterne: Zeichne viele kleine weiße Punkte als Sternenhimmel.
+   4.  Goldener Bonusstern: Ein seltener Stern, der 50 Punkte gibt.
+   5.  Herz-Objekt: Ein fallendes Herz, das ein Leben zurückgibt.
+   6.  Soundeffekte mit WebAudio: Kurze Töne beim Fangen eines Sterns oder einer Bombe.
+   7.  Power-Ups: Schutzschild, größerer Spieler oder Zeitlupe für ein paar Sekunden.
+   8.  Gegner, die sich seitlich bewegen: Bomben, die im Zickzack nach unten fallen.
+   9.  Level-System: Alle 100 Punkte ein neues Level mit Anzeige und neuer Farbe.
+   10. Zweispielermodus: Zweiter Spieler mit eigenen Tasten (z.B. J / L) und eigenen Punkten.
+*/
+</script>
+</body>
+</html>
